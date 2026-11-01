@@ -1,6 +1,7 @@
-import { Action, ActionPanel, Icon, List, Toast, showToast } from "@raycast/api";
+import { Action, ActionPanel, Icon, List, Toast, showToast, useNavigation } from "@raycast/api";
 import { useEffect, useRef, useState } from "react";
 import {
+  AuthHandoffCancelledError,
   getAuthState,
   getSavedAuthAccounts,
   redeemAuthHandoff,
@@ -10,6 +11,8 @@ import {
   startAuthHandoff,
 } from "./lib/auth";
 import { getWebCullPreferences } from "./lib/preferences";
+import { getCapabilityState } from "./lib/webcullClient";
+import { WebCullAuthError } from "./lib/http";
 import { WebCullAuthState, WebCullSavedAccount } from "./types";
 
 type HandoffState = {
@@ -21,7 +24,14 @@ type HandoffState = {
 
 type ConnectState = "idle" | "waiting" | "connected" | "error";
 
-export default function ConnectAccount() {
+export default function ConnectAccount({
+  reauthorize = false,
+  onConnected,
+}: {
+  reauthorize?: boolean;
+  onConnected?: () => void | Promise<void>;
+} = {}) {
+  const { pop } = useNavigation();
   const [auth, setAuth] = useState<WebCullAuthState>({ connected: false });
   const [accounts, setAccounts] = useState<WebCullSavedAccount[]>([]);
   const [activeAccountId, setActiveAccountId] = useState<string | null>(null);
@@ -29,19 +39,27 @@ export default function ConnectAccount() {
   const [state, setState] = useState<ConnectState>("idle");
   const [message, setMessage] = useState("Open WebCull in your browser to approve Raycast.");
   const pollRef = useRef<NodeJS.Timeout | null>(null);
+  const attemptRef = useRef(0);
+
+  function cancelConnect() {
+    attemptRef.current += 1;
+    if (pollRef.current) clearTimeout(pollRef.current);
+    pollRef.current = null;
+  }
 
   useEffect(() => {
-    reloadAccountState();
+    const attempt = attemptRef.current;
+    if (reauthorize) beginConnect();
+    else reloadAccountState(() => attempt === attemptRef.current);
 
     return () => {
-      if (pollRef.current) {
-        clearTimeout(pollRef.current);
-      }
+      cancelConnect();
     };
   }, []);
 
-  async function reloadAccountState() {
+  async function reloadAccountState(isCurrent = () => true) {
     const [nextAuth, saved] = await Promise.all([getAuthState(), getSavedAuthAccounts()]);
+    if (!isCurrent()) return;
     setAuth(nextAuth);
     setAccounts(saved.accounts);
     setActiveAccountId(saved.activeAccountId);
@@ -55,16 +73,24 @@ export default function ConnectAccount() {
   }
 
   async function beginConnect() {
+    cancelConnect();
+    const attempt = attemptRef.current;
+    const isCurrent = () => attempt === attemptRef.current;
+    setHandoff(null);
+    setState("waiting");
+    setMessage("Starting WebCull login.");
     try {
-      if (pollRef.current) {
-        clearTimeout(pollRef.current);
-      }
-      const nextHandoff = await startAuthHandoff();
+      const nextHandoff = await startAuthHandoff(isCurrent);
+      if (!isCurrent()) return;
       setHandoff(nextHandoff);
       setState("waiting");
       setMessage("Approve only if you started this WebCull connection just now.");
-      poll(nextHandoff);
+      poll(nextHandoff, isCurrent);
     } catch (error) {
+      if (!isCurrent()) {
+        console.error("Superseded WebCull login could not start", error);
+        return;
+      }
       setState("error");
       setMessage(error instanceof Error ? error.message : "Could not start WebCull login.");
       await showToast({
@@ -75,7 +101,8 @@ export default function ConnectAccount() {
     }
   }
 
-  async function poll(currentHandoff: HandoffState) {
+  async function poll(currentHandoff: HandoffState, isCurrent: () => boolean) {
+    if (!isCurrent()) return;
     try {
       if (Date.now() > currentHandoff.expires) {
         setState("error");
@@ -83,11 +110,17 @@ export default function ConnectAccount() {
         return;
       }
 
-      const response = await redeemAuthHandoff(currentHandoff.request, currentHandoff.verifier);
+      const response = await redeemAuthHandoff(
+        currentHandoff.request,
+        currentHandoff.verifier,
+        isCurrent,
+      );
+      if (!isCurrent()) return;
 
       if (response.success === "true") {
-        await reloadAccountState();
+        await reloadAccountState(isCurrent);
         const nextAuth = await getAuthState();
+        if (!isCurrent()) return;
         setState("connected");
         setMessage("Raycast is connected to WebCull.");
         await showToast({
@@ -95,23 +128,34 @@ export default function ConnectAccount() {
           title: "Connected to WebCull",
           message: nextAuth.user?.email || nextAuth.user?.name,
         });
+        if (onConnected && isCurrent()) {
+          await onConnected();
+          if (isCurrent()) pop();
+        }
         return;
       }
 
       if (response.pending === "true") {
-        pollRef.current = setTimeout(() => poll(currentHandoff), 2000);
+        pollRef.current = setTimeout(() => poll(currentHandoff, isCurrent), 2000);
         return;
       }
 
       setState("error");
       setMessage(response.failure || response.error || "WebCull login was not approved.");
     } catch (error) {
+      if (!isCurrent()) {
+        if (!(error instanceof AuthHandoffCancelledError)) {
+          console.error("Superseded WebCull login cleanup failed", error);
+        }
+        return;
+      }
       setMessage(error instanceof Error ? error.message : "Waiting for WebCull approval.");
-      pollRef.current = setTimeout(() => poll(currentHandoff), 3000);
+      pollRef.current = setTimeout(() => poll(currentHandoff, isCurrent), 3000);
     }
   }
 
   async function disconnect() {
+    cancelConnect();
     if (!auth.accountId) {
       return;
     }
@@ -133,6 +177,7 @@ export default function ConnectAccount() {
   }
 
   async function disconnectAll() {
+    cancelConnect();
     try {
       await revokeAllAuthAccounts();
       setHandoff(null);
@@ -142,6 +187,7 @@ export default function ConnectAccount() {
         title: "Logged out of all saved WebCull accounts",
       });
     } catch (error) {
+      await reloadAccountState();
       await showToast({
         style: Toast.Style.Failure,
         title: "Could not log out of all saved accounts",
@@ -154,7 +200,7 @@ export default function ConnectAccount() {
   const activeTitle = auth.connected ? accountTitle(auth) : "No active account";
   const title = state === "waiting" ? "Waiting for Browser Approval" : "Manage WebCull Account";
 
-  if (state !== "waiting" && accounts.length) {
+  if (!reauthorize && state !== "waiting" && accounts.length) {
     return (
       <List>
         <List.Item
@@ -174,6 +220,19 @@ export default function ConnectAccount() {
                     onChange={reloadAccountState}
                   />
                 }
+              />
+            </ActionPanel>
+          }
+        />
+        <List.Item
+          icon={Icon.Link}
+          title="Reconnect WebCull"
+          subtitle="Approve a new Raycast connection for your account in the browser."
+          actions={
+            <ActionPanel>
+              <Action.Push
+                title="Reconnect WebCull"
+                target={<ConnectAccount reauthorize onConnected={reloadAccountState} />}
               />
             </ActionPanel>
           }
@@ -248,7 +307,7 @@ export default function ConnectAccount() {
         subtitle={message}
         actions={
           <ActionPanel>
-            {!auth.connected ? (
+            {!auth.connected || reauthorize ? (
               <Action title="Open WebCull Login" icon={Icon.Link} onAction={beginConnect} />
             ) : null}
             {handoff ? (
@@ -272,6 +331,7 @@ function SavedAccountsView({
 }) {
   const [accounts, setAccounts] = useState<WebCullSavedAccount[]>(initialAccounts);
   const [activeAccountId, setActiveAccountId] = useState<string | null>(initialActiveAccountId);
+  const { push } = useNavigation();
 
   async function reload() {
     const saved = await getSavedAuthAccounts();
@@ -281,13 +341,26 @@ function SavedAccountsView({
   }
 
   async function useAccount(account: WebCullSavedAccount) {
-    await setActiveAuthAccount(account.accountId);
-    await reload();
-    await showToast({
-      style: Toast.Style.Success,
-      title: "Active WebCull account changed",
-      message: accountTitle(account),
-    });
+    try {
+      await setActiveAuthAccount(account.accountId);
+      await getCapabilityState();
+      await reload();
+      await showToast({
+        style: Toast.Style.Success,
+        title: "Active WebCull account changed",
+        message: accountTitle(account),
+      });
+    } catch (error) {
+      await reload();
+      if (error instanceof WebCullAuthError) {
+        push(<ConnectAccount reauthorize onConnected={reload} />);
+      }
+      await showToast({
+        style: Toast.Style.Failure,
+        title: "Could not connect to WebCull",
+        message: error instanceof Error ? error.message : "Unknown error",
+      });
+    }
   }
 
   async function removeAccount(account: WebCullSavedAccount) {
@@ -325,6 +398,10 @@ function SavedAccountsView({
                   title={isActive ? "Keep as Active Account" : "Set as Active Account"}
                   icon={Icon.CheckCircle}
                   onAction={() => useAccount(account)}
+                />
+                <Action.Push
+                  title="Reconnect WebCull"
+                  target={<ConnectAccount reauthorize onConnected={reload} />}
                 />
                 <Action
                   title="Log Out Saved Account"

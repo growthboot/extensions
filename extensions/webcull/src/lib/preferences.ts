@@ -1,4 +1,4 @@
-import { environment, getPreferenceValues } from "@raycast/api";
+import { environment } from "@raycast/api";
 
 const PRODUCTION_API_BASE_URL = "https://xapi.webcull.com";
 const PRODUCTION_APP_BASE_URL = "https://app.webcull.com";
@@ -9,12 +9,11 @@ export type WebCullPreferences = {
 };
 
 export function getWebCullPreferences(): WebCullPreferences {
-  const preferences = getPreferenceValues<Partial<WebCullPreferences>>();
   const defaults = getDefaultWebCullUrls();
 
   return {
-    apiBaseUrl: trimTrailingSlash(preferences.apiBaseUrl || defaults.apiBaseUrl),
-    appBaseUrl: trimTrailingSlash(preferences.appBaseUrl || defaults.appBaseUrl),
+    apiBaseUrl: trimTrailingSlash(defaults.apiBaseUrl),
+    appBaseUrl: trimTrailingSlash(defaults.appBaseUrl),
   };
 }
 

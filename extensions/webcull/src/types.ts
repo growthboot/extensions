@@ -1,4 +1,5 @@
 export type WebCullBookmark = {
+  accountId: string;
   id: string;
   title: string;
   url: string;
@@ -15,6 +16,7 @@ export type WebCullStack = {
 };
 
 export type WebCullCapabilityState = {
+  accountId?: string;
   bookmarksSearch: boolean;
   bookmarkWrite: boolean;
   e2eeEnabled: boolean;
@@ -25,6 +27,7 @@ export type WebCullCapabilityState = {
 };
 
 export type WebCullSavePayload = {
+  accountId: string;
   parentStackId: string;
   url: string;
   title: string;

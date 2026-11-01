@@ -1,6 +1,6 @@
 import { LocalStorage, open } from "@raycast/api";
 import crypto from "node:crypto";
-import { postWebCull, responseMessage } from "./http";
+import { postWebCull, responseMessage, WebCullAuthError } from "./http";
 import { getWebCullPreferences } from "./preferences";
 import { WebCullAuthState, WebCullAuthTokenResponse, WebCullSavedAccount } from "../types";
 
@@ -8,6 +8,13 @@ const TOKEN_KEY = "webcull_auth_token";
 const ACCOUNTS_KEY = "webcull_auth_accounts";
 const ACTIVE_ACCOUNT_KEY = "webcull_active_account_id";
 const REQUEST_TTL_MS = 300000;
+let tokenSaveQueue: Promise<void> = Promise.resolve();
+
+export class AuthHandoffCancelledError extends Error {
+  constructor() {
+    super("WebCull login was cancelled or replaced.");
+  }
+}
 
 export function randomBase64Url(bytes: number): string {
   return crypto.randomBytes(bytes).toString("base64url");
@@ -56,8 +63,8 @@ export async function getSavedAuthAccounts(): Promise<{
     return { accounts, activeAccountId };
   }
 
-  await LocalStorage.setItem(ACTIVE_ACCOUNT_KEY, accounts[0].accountId);
-  return { accounts, activeAccountId: accounts[0].accountId };
+  await LocalStorage.removeItem(ACTIVE_ACCOUNT_KEY);
+  return { accounts, activeAccountId: null };
 }
 
 export async function getActiveAccount(): Promise<WebCullSavedAccount | null> {
@@ -88,32 +95,70 @@ export async function removeAuthAccount(accountId: string): Promise<void> {
   }
 
   if (activeAccountId === accountId) {
-    await LocalStorage.setItem(ACTIVE_ACCOUNT_KEY, nextAccounts[0].accountId);
+    await LocalStorage.removeItem(ACTIVE_ACCOUNT_KEY);
   }
 }
 
-export async function requireAuthToken(): Promise<string> {
+export async function requireAuthToken(expectedAccountId: string): Promise<string> {
   const auth = await getAuthState();
 
   if (!auth.connected || !auth.token) {
-    throw new Error("Connect WebCull first.");
+    throw new WebCullAuthError();
+  }
+
+  if (!expectedAccountId || auth.accountId !== expectedAccountId) {
+    throw new Error("The active WebCull account changed. Reopen this command before saving.");
   }
 
   return auth.token;
 }
 
-export async function saveAuthToken(response: WebCullAuthTokenResponse): Promise<void> {
+export async function postAuthenticatedWebCull(
+  apiBaseUrl: string,
+  path: string,
+  data: Parameters<typeof postWebCull>[2],
+  token: string,
+) {
+  try {
+    return await postWebCull(apiBaseUrl, path, data, token);
+  } catch (error) {
+    if (error instanceof WebCullAuthError) {
+      // A late rejection must never remove a replacement token or another account.
+      const discard = async () => {
+        const { accounts } = await getSavedAuthAccounts();
+        const rejected = accounts.find((account) => account.token === token);
+        if (rejected) await removeAuthAccount(rejected.accountId);
+      };
+      const pending = tokenSaveQueue.then(discard, discard);
+      tokenSaveQueue = pending;
+      await pending;
+    }
+    throw error;
+  }
+}
+
+async function saveAuthToken(
+  response: WebCullAuthTokenResponse,
+  isCurrent: () => boolean,
+): Promise<void> {
+  const assertCurrent = () => {
+    if (!isCurrent()) throw new AuthHandoffCancelledError();
+  };
+  assertCurrent();
   if (response.success !== "true" || !response.token || !response.expires) {
     throw new Error(response.failure || response.error || "WebCull login did not return a token.");
   }
 
   const { accounts } = await getSavedAuthAccounts();
+  assertCurrent();
   const account = tokenResponseToAccount(response);
   const replacedAccount = accounts.find(
     (savedAccount) => savedAccount.accountId === account.accountId,
   );
   if (replacedAccount && replacedAccount.token !== account.token) {
     await revokeAuthToken(replacedAccount.token);
+    await removeAuthAccount(replacedAccount.accountId);
+    assertCurrent();
   }
   const nextAccounts = [
     account,
@@ -121,8 +166,11 @@ export async function saveAuthToken(response: WebCullAuthTokenResponse): Promise
   ];
 
   await saveAccounts(nextAccounts);
+  assertCurrent();
   await LocalStorage.setItem(ACTIVE_ACCOUNT_KEY, account.accountId);
+  assertCurrent();
   await LocalStorage.removeItem(TOKEN_KEY);
+  assertCurrent();
 }
 
 async function revokeAuthToken(token: string): Promise<void> {
@@ -153,11 +201,12 @@ export async function revokeAllAuthAccounts(): Promise<void> {
   const { accounts } = await getSavedAuthAccounts();
   for (const account of accounts) {
     await revokeAuthToken(account.token);
+    await removeAuthAccount(account.accountId);
   }
   await clearAllAuthTokens();
 }
 
-export async function startAuthHandoff(): Promise<{
+export async function startAuthHandoff(isCurrent: () => boolean): Promise<{
   request: string;
   verifier: string;
   approvalUrl: string;
@@ -177,7 +226,7 @@ export async function startAuthHandoff(): Promise<{
   }
 
   const approvalUrl = `${preferences.appBaseUrl}/accounts#raycast-auth/${encodeURIComponent(request)}`;
-  await open(approvalUrl);
+  if (isCurrent()) await open(approvalUrl);
 
   return {
     request,
@@ -190,6 +239,7 @@ export async function startAuthHandoff(): Promise<{
 export async function redeemAuthHandoff(
   request: string,
   verifier: string,
+  isCurrent: () => boolean,
 ): Promise<WebCullAuthTokenResponse> {
   const preferences = getWebCullPreferences();
   const response = (await postWebCull(preferences.apiBaseUrl, "/raycast/auth-redeem", {
@@ -199,21 +249,35 @@ export async function redeemAuthHandoff(
   })) as WebCullAuthTokenResponse;
 
   if (response.success === "true") {
-    try {
-      await saveAuthToken(response);
-    } catch (error) {
-      if (!response.token) {
+    // Serialize commits and cleanup so an older attempt cannot overwrite a newer token.
+    const save = async () => {
+      try {
+        await saveAuthToken(response, isCurrent);
+      } catch (error) {
+        if (!response.token) throw error;
+        try {
+          await revokeAuthToken(response.token);
+        } catch {
+          throw new Error(
+            "WebCull could not discard the unused Raycast authorization. Check connected applications in WebCull before reconnecting.",
+          );
+        } finally {
+          const account = tokenResponseToAccount(response);
+          const { accounts } = await getSavedAuthAccounts();
+          if (
+            accounts.some(
+              (saved) => saved.accountId === account.accountId && saved.token === account.token,
+            )
+          ) {
+            await removeAuthAccount(account.accountId);
+          }
+        }
         throw error;
       }
-      try {
-        await revokeAuthToken(response.token);
-      } catch {
-        throw new Error(
-          "WebCull could not safely replace the saved Raycast authorization. Reconnect after checking connected applications in WebCull.",
-        );
-      }
-      throw error;
-    }
+    };
+    const pendingSave = tokenSaveQueue.then(save, save);
+    tokenSaveQueue = pendingSave;
+    await pendingSave;
   }
 
   return response;

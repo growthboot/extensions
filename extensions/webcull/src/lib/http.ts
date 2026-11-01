@@ -1,7 +1,11 @@
-import { environment } from "@raycast/api";
-
 type PostValue = string | number | boolean | null | undefined;
 export type WebCullApiResponse = Record<string, unknown>;
+
+export class WebCullAuthError extends Error {
+  constructor() {
+    super("Your WebCull authorization is no longer valid. Reconnect WebCull to continue.");
+  }
+}
 
 export async function postWebCull(
   apiBaseUrl: string,
@@ -27,7 +31,6 @@ export async function postWebCull(
   }
 
   const url = new URL(path, apiBaseUrl);
-  allowDevelopmentLocalTls(url);
 
   let response: Response;
   try {
@@ -50,6 +53,12 @@ export async function postWebCull(
     throw new Error("Invalid JSON response from WebCull.");
   }
 
+  if (
+    ["token_required", "invalid_token", "token_expired_or_revoked"].includes(String(parsed.code))
+  ) {
+    throw new WebCullAuthError();
+  }
+
   if (!response.ok) {
     throw new Error(safeMessage(parsed.failure || parsed.error || "WebCull API request failed."));
   }
@@ -59,22 +68,6 @@ export async function postWebCull(
   }
 
   return parsed;
-}
-
-function allowDevelopmentLocalTls(url: URL): void {
-  if (!environment.isDevelopment || !isDevelopmentLocalHost(url.hostname)) {
-    return;
-  }
-  process.env.NODE_TLS_REJECT_UNAUTHORIZED = "0";
-}
-
-function isDevelopmentLocalHost(hostname: string): boolean {
-  return (
-    hostname === "localhost" ||
-    hostname === "127.0.0.1" ||
-    hostname === "::1" ||
-    hostname.endsWith(".testwebcull.test")
-  );
 }
 
 function networkFailureMessage(url: URL, error: unknown): string {

@@ -5,8 +5,8 @@ import {
   WebCullStack,
 } from "../types";
 import { folderUrl } from "./folderLink";
-import { getAuthState, requireAuthToken } from "./auth";
-import { postWebCull, responseItems, responseMessage } from "./http";
+import { getAuthState, postAuthenticatedWebCull, requireAuthToken } from "./auth";
+import { responseItems, responseMessage, WebCullAuthError } from "./http";
 import { getWebCullPreferences, WebCullPreferences } from "./preferences";
 
 type CliBookmarkRow = {
@@ -35,6 +35,7 @@ export async function getCapabilityState(): Promise<WebCullCapabilityState> {
 
   const unsupported = await accountRequiresEncryption(getWebCullPreferences(), auth.token);
   return {
+    accountId: auth.accountId,
     bookmarksSearch: !unsupported,
     bookmarkWrite: !unsupported,
     e2eeEnabled: unsupported,
@@ -50,7 +51,8 @@ export async function searchWebCullBookmarks(
 ): Promise<WebCullBookmark[]> {
   const auth = await getAuthState();
   const token = auth.token;
-  if (!auth.connected || !token) throw new Error("Connect WebCull first.");
+  const accountId = auth.accountId;
+  if (!auth.connected || !token || !accountId) throw new WebCullAuthError();
   const accountHash = auth.user?.hash;
   if (!accountHash) {
     throw new Error("Reconnect WebCull to load your account link.");
@@ -62,7 +64,7 @@ export async function searchWebCullBookmarks(
   }
 
   await requireUnencryptedAccount(preferences, token);
-  const response = await postWebCull(
+  const response = await postAuthenticatedWebCull(
     preferences.apiBaseUrl,
     "/raycast/bookmarks-search",
     {
@@ -82,13 +84,18 @@ export async function searchWebCullBookmarks(
 
   return responseItems<CliBookmarkRow>(response)
     .filter((row: CliBookmarkRow) => row.type === "bookmark")
-    .map((row: CliBookmarkRow) => rowToBookmark(row, preferences.appBaseUrl, accountHash));
+    .map((row: CliBookmarkRow) =>
+      rowToBookmark(row, preferences.appBaseUrl, accountHash, accountId),
+    );
 }
 
-export async function getStacks(preferences: WebCullPreferences): Promise<WebCullStack[]> {
-  const token = await requireAuthToken();
+export async function getStacks(
+  preferences: WebCullPreferences,
+  accountId: string,
+): Promise<WebCullStack[]> {
+  const token = await requireAuthToken(accountId);
   await requireUnencryptedAccount(preferences, token);
-  const response = await postWebCull(
+  const response = await postAuthenticatedWebCull(
     preferences.apiBaseUrl,
     "/raycast/bookmarks-search",
     {
@@ -120,14 +127,22 @@ export async function saveBookmark(
   preferences: WebCullPreferences,
   payload: WebCullSavePayload,
 ): Promise<void> {
-  const token = await requireAuthToken();
+  const url = payload.url.trim();
+  if (!isSaveableUrl(url)) {
+    throw new Error("Enter a full http:// or https:// URL without embedded credentials.");
+  }
+  const token = await requireAuthToken(payload.accountId);
   await requireUnencryptedAccount(preferences, token);
-  const response = await postWebCull(
+  // Metadata is asynchronous; do not submit a form after an account switch or expiry.
+  if ((await requireAuthToken(payload.accountId)) !== token) {
+    throw new Error("WebCull authorization changed. Reopen this command before saving.");
+  }
+  const response = await postAuthenticatedWebCull(
     preferences.apiBaseUrl,
     "/raycast/bookmarks-create",
     {
       type: "bookmark",
-      url: payload.url,
+      url,
       title: payload.title,
       parent_id: payload.parentStackId,
       dry_run: "0",
@@ -140,16 +155,28 @@ export async function saveBookmark(
   }
 }
 
+function isSaveableUrl(value: string): boolean {
+  if (!/^https?:\/\//i.test(value) || /[\s\\\x00-\x1f\x7f]/.test(value)) return false;
+  try {
+    const url = new URL(value);
+    return Boolean(url.hostname) && !url.username && !url.password;
+  } catch {
+    return false;
+  }
+}
+
 function rowToBookmark(
   row: CliBookmarkRow,
   appBaseUrl: string,
   accountHash: string,
+  accountId: string,
 ): WebCullBookmark {
   const title = row.title || row.url || `Bookmark ${row.id}`;
   const parentStackId = String(row.parent_id || 0);
   const parentStackPath = parentStackId === "0" ? "Root" : `Folder #${parentStackId}`;
 
   return {
+    accountId,
     id: String(row.id),
     title,
     url: row.url || "",
@@ -172,7 +199,12 @@ async function accountRequiresEncryption(
   preferences: WebCullPreferences,
   token: string,
 ): Promise<boolean> {
-  const response = await postWebCull(preferences.apiBaseUrl, "/raycast/metadata", {}, token);
+  const response = await postAuthenticatedWebCull(
+    preferences.apiBaseUrl,
+    "/raycast/metadata",
+    {},
+    token,
+  );
   if (response.success !== "true") {
     throw new Error(responseMessage(response, "Could not check WebCull account support."));
   }
